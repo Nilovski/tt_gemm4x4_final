@@ -13,6 +13,8 @@
 #     >>> import tt_um_sahpar_gemm4x4 as g
 #     >>> g.main()                 # self-test on silicon
 #     >>> g.demo_8x8()             # 8x8 int8 matmul on the 4x4 chip, checked
+#     >>> g.matmul([[1, 2], [3, 4]], [[5, 6], [7, 8]])        # your own int8 data
+#     >>> g.matmul([[0.5, -1.25]], [[2.0], [3.5]])            # real numbers (BF16)
 #
 # Pins: the RP2 drives ui_in[7:0], uio[0] RX_VALID and uio[2] TX_READY; it
 # reads uo_out[7:0], uio[1] RX_READY, uio[3] TX_VALID, uio[4] BUSY, uio[5] DONE.
@@ -38,6 +40,7 @@ async def reset(dut):
     cocotb.start_soon(Clock(dut.clk, CLOCK_PERIOD_US, units="us").start())
     dut.ui_in.value = 0
     dut.uio_in.value = 0
+    gp._host_uio.clear()
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
@@ -122,7 +125,9 @@ cocotb.set_runner_scope(DEMO_SCOPE)
 @cocotb.test()
 async def demo_matmul(dut):
     await reset(dut)
-    _demo["c"] = await gp.matmul(dut, _demo["a"], _demo["b"], 8, 8, 8)
+    n, k, m = _demo["dims"]
+    run = gp.matmul_real if _demo.get("real") else gp.matmul
+    _demo["c"] = await run(dut, _demo["a"], _demo["b"], n, k, m)
 
 
 cocotb.set_runner_scope(__name__)
@@ -162,6 +167,7 @@ def demo_8x8(seed=42):
     random.seed(seed)
     _demo.clear()
     _demo["a"], _demo["b"] = _rand_int8(64), _rand_int8(64)
+    _demo["dims"] = (8, 8, 8)
     cocotb.get_runner(DEMO_SCOPE).test(_make_dut())
     c = _demo.get("c")
     if c is None:
@@ -171,3 +177,47 @@ def demo_8x8(seed=42):
         print(" ".join("{:7d}".format(v) for v in c[r * 8:(r + 1) * 8]))
     print("matches reference:", c == gp.matmul_ref(_demo["a"], _demo["b"], 8, 8, 8))
     return c
+
+
+def _is_int8(v):
+    return isinstance(v, int) and -128 <= v <= 127
+
+
+def matmul(A, B, real=None, check=True):
+    """C = A x B on the chip for your own matrices (lists of rows).
+
+    A is n x k, B is k x m, any size. If every value is an integer in
+    [-128, 127] the int8 path is used (exact); otherwise (or with real=True)
+    values are sent as BF16 and C comes back as FP32. Prints C and returns it
+    as a list of rows. With check=True the int8 result is compared to Python.
+    """
+    n, k = len(A), len(A[0])
+    if len(B) != k:
+        raise ValueError("A is {}x{} but B has {} rows".format(n, k, len(B)))
+    m = len(B[0])
+    a = [v for row in A for v in row]
+    b = [v for row in B for v in row]
+    if len(a) != n * k or len(b) != k * m:
+        raise ValueError("rows must all have the same length")
+    if real is None:
+        real = not all(_is_int8(v) for v in a + b)
+    _setup()
+    _demo.clear()
+    _demo["a"] = [float(v) for v in a] if real else a
+    _demo["b"] = [float(v) for v in b] if real else b
+    _demo["dims"] = (n, k, m)
+    _demo["real"] = real
+    cocotb.get_runner(DEMO_SCOPE).test(_make_dut())
+    c = _demo.get("c")
+    if c is None:
+        print("matmul did not complete")
+        return None
+    rows = [c[r * m:(r + 1) * m] for r in range(n)]
+    for row in rows:
+        if real:
+            print(" ".join("{:12.5g}".format(v) for v in row))
+        else:
+            print(" ".join("{:9d}".format(v) for v in row))
+    if check and not real:
+        print("matches reference:", c == gp.matmul_ref(a, b, n, k, m))
+    return rows

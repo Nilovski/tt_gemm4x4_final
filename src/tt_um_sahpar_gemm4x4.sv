@@ -90,7 +90,7 @@ module tt_um_sahpar_gemm4x4 (
     logic [N*N*ACC_W-1:0]  c_flat;
 
     cmd_decoder #(
-        .N(N), .K(K), .ACC_W(ACC_W), .CHIP_ID(8'hA4), .AW(AW)
+        .N(N), .K(K), .ACC_W(ACC_W), .CHIP_ID(8'hA8), .AW(AW)
     ) u_decoder (
         .clk             (clk),
         .rst_n           (rst_n),

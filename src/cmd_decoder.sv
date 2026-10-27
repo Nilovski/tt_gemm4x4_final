@@ -11,18 +11,27 @@
 //   0x13  LOAD_B_REAL     -- followed by K*N BF16 values, as above
 //   0x20  GEMM            -- pulses start (ignored while busy); C += A x B
 //   0x21  CLEAR_GEMM      -- pulses start (ignored while busy); C  = A x B
+//   0x30  READ_C          -- streams all of C: N*N elements, row-major,
+//                            4 bytes each (signed int32, low byte first)
 //   0x31  READ_C_ELEMENT  -- followed by 1 address byte (elem*4 + byte),
 //                            replies with that byte of C as signed int32
 //   0x32  READ_C_REAL     -- followed by 1 address byte (elem*4 + byte),
 //                            replies with that byte of C as an FP32 value,
 //                            C_int * 2^(scale_A + scale_B)
-//   0x40  STATUS          -- replies {5'b0, scale_mismatch, done, busy}
-//                            done: sticky, set when a run finishes, cleared
-//                            by the next GEMM/CLEAR_GEMM (also on a pin)
-//                            scale_mismatch: a GEMM (accumulate) ran with a
-//                            different A/B scale than the run it adds to, so
-//                            READ_C_REAL is not meaningful; cleared by
-//                            CLEAR_GEMM
+//   0x33  READ_C_REAL_ALL -- streams all of C as FP32, same order as READ_C
+//   0x40  STATUS          -- replies
+//                            bit 0 busy
+//                            bit 1 done: sticky, set when a run finishes,
+//                                  cleared by the next GEMM/CLEAR_GEMM (pin)
+//                            bit 2 A_loaded: a complete A has been loaded
+//                            bit 3 B_loaded: a complete B has been loaded
+//                            bit 4 result_valid: C holds a finished result
+//                            bit 5 error: sticky, cleared by CLEAR_GEMM. Set
+//                                  when a LOAD/GEMM/CLEAR_GEMM arrives while
+//                                  busy (ignored), or when a GEMM accumulates
+//                                  with a different A/B scale than the run it
+//                                  adds to (READ_C_REAL then not meaningful)
+//                            bits 7:6 reserved (0)
 //   0x41  ID              -- replies CHIP_ID
 //
 // Anything else is ignored.
@@ -42,7 +51,7 @@ module cmd_decoder #(
     parameter int N        = 4,
     parameter int K        = 4,
     parameter int ACC_W    = 21,
-    parameter logic [7:0] CHIP_ID = 8'hA4,
+    parameter logic [7:0] CHIP_ID = 8'hA8,
     parameter int AW       = $clog2(2 * N * K)
 ) (
     input  logic clk,
@@ -90,15 +99,18 @@ module cmd_decoder #(
     localparam logic [7:0] OP_LOAD_B_REAL    = 8'h13;
     localparam logic [7:0] OP_GEMM           = 8'h20;
     localparam logic [7:0] OP_CLEAR_GEMM     = 8'h21;
+    localparam logic [7:0] OP_READ_C         = 8'h30;
     localparam logic [7:0] OP_READ_C_ELEMENT = 8'h31;
     localparam logic [7:0] OP_READ_C_REAL    = 8'h32;
+    localparam logic [7:0] OP_READ_C_REAL_ALL = 8'h33;
     localparam logic [7:0] OP_STATUS         = 8'h40;
     localparam logic [7:0] OP_ID             = 8'h41;
 
     typedef enum logic [1:0] {
         S_IDLE,
         S_LOAD,
-        S_READ_ADDR
+        S_READ_ADDR,
+        S_READ_ALL
     } state_t;
 
     state_t        state;
@@ -110,6 +122,10 @@ module cmd_decoder #(
 
     logic signed [10:0] c_scale;       // scale of the values in C
     logic               scale_mismatch;
+    logic               cmd_dropped;    // command ignored because busy
+    logic               a_loaded, b_loaded;
+    localparam int RW = $clog2(4 * NUM_C_ELEMS);
+    logic [RW-1:0]      rd_cnt;         // READ_C stream position
     logic signed [10:0] run_scale;
 
     assign run_scale = 11'(scale_a) + 11'(scale_b);
@@ -137,8 +153,10 @@ module cmd_decoder #(
     logic [31:0]             rd_int, rd_fp, rd_word;
     logic [7:0]              rd_data;
 
-    assign rd_elem = rx_byte[EW+1:2];
-    assign rd_byte = rx_byte[1:0];
+    logic [7:0] rd_addr;
+    assign rd_addr = (state == S_READ_ALL) ? 8'(rd_cnt) : rx_byte;
+    assign rd_elem = rd_addr[EW+1:2];
+    assign rd_byte = rd_addr[1:0];
     assign rd_acc  = c_flat[rd_elem*ACC_W +: ACC_W];
     assign rd_int  = 32'(rd_acc);                 // sign-extending cast
 
@@ -151,8 +169,8 @@ module cmd_decoder #(
     assign rd_word = read_real ? rd_fp : rd_int;
     assign rd_data = rd_word[rd_byte*8 +: 8];
 
-    // At most one reply is issued per command and the host drains it before
-    // sending the next command, so tx_ready back-pressure is not modelled.
+    // Single-byte replies go out directly (the host drains each one before
+    // sending the next command); READ_C streams wait for tx_ready per byte.
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -167,6 +185,10 @@ module cmd_decoder #(
             result_done     <= 1'b0;
             c_scale         <= '0;
             scale_mismatch  <= 1'b0;
+            cmd_dropped     <= 1'b0;
+            a_loaded        <= 1'b0;
+            b_loaded        <= 1'b0;
+            rd_cnt          <= '0;
             tx_byte         <= '0;
             tx_byte_valid   <= 1'b0;
         end else begin
@@ -184,6 +206,7 @@ module cmd_decoder #(
                             state     <= S_LOAD;
                             load_b    <= rx_byte[0];
                             load_drop <= gemm_busy;
+                            if (gemm_busy) cmd_dropped <= 1'b1;
                             idx       <= '0;
                             last_idx  <= rx_byte[1] ? AW'(NUM_REAL_BYTES - 1)
                                                     : AW'(NUM_INT_BYTES - 1);
@@ -195,7 +218,9 @@ module cmd_decoder #(
                                 tx_byte_valid <= 1'b1;
                             end
                             OP_STATUS: begin
-                                tx_byte       <= {5'b0, scale_mismatch, result_done, gemm_busy};
+                                tx_byte       <= {2'b0, scale_mismatch | cmd_dropped,
+                                                  result_done, b_loaded, a_loaded,
+                                                  result_done, gemm_busy};
                                 tx_byte_valid <= 1'b1;
                             end
                             OP_GEMM, OP_CLEAR_GEMM: begin
@@ -203,11 +228,19 @@ module cmd_decoder #(
                                     gemm_start      <= 1'b1;
                                     gemm_accumulate <= (rx_byte == OP_GEMM);
                                     c_scale         <= run_scale;
-                                    if (rx_byte == OP_CLEAR_GEMM)
+                                    if (rx_byte == OP_CLEAR_GEMM) begin
                                         scale_mismatch <= 1'b0;
-                                    else if (run_scale != c_scale)
+                                        cmd_dropped    <= 1'b0;
+                                    end else if (run_scale != c_scale)
                                         scale_mismatch <= 1'b1;
+                                end else begin
+                                    cmd_dropped <= 1'b1;
                                 end
+                            end
+                            OP_READ_C, OP_READ_C_REAL_ALL: begin
+                                state     <= S_READ_ALL;
+                                read_real <= rx_byte[0];
+                                rd_cnt    <= '0;
                             end
                             OP_READ_C_ELEMENT, OP_READ_C_REAL: begin
                                 state     <= S_READ_ADDR;
@@ -220,8 +253,15 @@ module cmd_decoder #(
 
                 S_LOAD: begin
                     if (rx_byte_valid) begin
-                        if (idx == last_idx) state <= S_IDLE;
-                        else                 idx   <= idx + AW'(1);
+                        if (idx == last_idx) begin
+                            state <= S_IDLE;
+                            if (!load_drop) begin
+                                if (load_b) b_loaded <= 1'b1;
+                                else        a_loaded <= 1'b1;
+                            end
+                        end else begin
+                            idx <= idx + AW'(1);
+                        end
                     end
                 end
 
@@ -233,13 +273,24 @@ module cmd_decoder #(
                     end
                 end
 
+                // Stream one byte whenever the TX holding register is free.
+                // Bytes from the host during the stream are ignored.
+                S_READ_ALL: begin
+                    if (tx_ready && !tx_byte_valid) begin
+                        tx_byte       <= rd_data;
+                        tx_byte_valid <= 1'b1;
+                        if (rd_cnt == RW'(4 * NUM_C_ELEMS - 1)) state  <= S_IDLE;
+                        else                                    rd_cnt <= rd_cnt + RW'(1);
+                    end
+                end
+
                 default: state <= S_IDLE;
             endcase
         end
     end
 
     // address bits above the valid range (addr >= NUM_C_BYTES) alias/wrap
-    wire _unused = &{tx_ready, rx_byte[7:EW+2], 1'b0};
+    wire _unused = &{rd_addr[7:EW+2], 1'b0};
 
 endmodule
 

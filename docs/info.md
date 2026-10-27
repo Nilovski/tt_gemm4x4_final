@@ -42,14 +42,21 @@ out, held until the host pulses `TX_READY`.
 | `0x13` | LOAD_B_REAL    | 32 bytes: 16 BF16, low byte first   | none                    |
 | `0x20` | GEMM           | --                                  | none (C += A x B)       |
 | `0x21` | CLEAR_GEMM     | --                                  | none (C = A x B)        |
+| `0x30` | READ_C         | --                                  | all of C: 64 bytes (16 x int32) |
 | `0x31` | READ_C_ELEMENT | 1 address byte, 0-63                | 1 byte of C (int32)     |
 | `0x32` | READ_C_REAL    | 1 address byte, 0-63                | 1 byte of C (FP32)      |
-| `0x40` | STATUS         | --                                  | `{5'b0, scale_mismatch, done, busy}` |
-| `0x41` | ID             | --                                  | `0xA4`                  |
+| `0x33` | READ_C_REAL_ALL| --                                  | all of C: 64 bytes (16 x FP32) |
+| `0x40` | STATUS         | --                                  | status byte (below)     |
+| `0x41` | ID             | --                                  | `0xA8`                  |
 
-- C is read as 16 elements x 4 bytes: signed 32-bit, little-endian. The
-  address is `elem*4 + byte`, and `elem` goes in row-major order (c00, c01,
-  ... c33).
+STATUS bits: 0 busy, 1 done, 2 A_loaded, 3 B_loaded, 4 result_valid,
+5 error, 7:6 reserved. `error` is sticky until the next CLEAR_GEMM; it is set
+when a LOAD, GEMM or CLEAR_GEMM arrives while busy (and is ignored), or when a
+GEMM accumulates real data with a different scale than the run it adds to.
+
+- C is 16 elements x 4 bytes: signed 32-bit, little-endian, row-major (c00,
+  c01, ... c33). READ_C streams all 64 bytes, one per TX_READY handshake.
+  READ_C_ELEMENT reads one byte at address `elem*4 + byte`.
 - The accumulators are 21 bits, sign-extended to 32 on readout. They hold any
   sum of up to **63 products** exactly. That means one CLEAR_GEMM plus up to
   14 GEMMs (inner dimension up to 60) before C must be read out. For longer
@@ -59,7 +66,7 @@ out, held until the host pulses `TX_READY`.
   matrix has scale 1).
 - With real data, GEMM (accumulate) is only meaningful when the new A and B
   have the same combined scale as the run being added to; otherwise STATUS
-  bit 2 (scale_mismatch) is set until the next CLEAR_GEMM. The host helper
+  bit 5 (error) is set until the next CLEAR_GEMM. The host helper
   `matmul_real` therefore runs each K-block with CLEAR_GEMM and sums the
   FP32 results itself.
 - GEMM and CLEAR_GEMM are ignored while busy. A LOAD sent while busy has its
@@ -72,18 +79,18 @@ out, held until the host pulses `TX_READY`.
 
 ## How to test
 
-1. Reset, then send `0x41` (ID) and expect `0xA4`.
+1. Reset, then send `0x41` (ID) and expect `0xA8`.
 2. Send `0x10` and then 16 bytes of A. Send `0x11` and then 16 bytes of B.
    Negative values are two's complement.
 3. Send `0x21` (CLEAR_GEMM) to start.
 4. Wait for `uio[5]` DONE, or poll `0x40` until bit 0 (busy) reads 0.
-5. For each address 0-63, send `0x31` and then the address, and collect the
-   reply byte. Reassemble the 16 little-endian 32-bit values.
+5. Send `0x30` (READ_C) and collect 64 reply bytes. Reassemble the 16
+   little-endian 32-bit values.
 
 To accumulate, load new A/B blocks and send `0x20` instead of `0x21`.
 
 For real numbers, use `0x12`/`0x13` with 16 BF16 values (2 bytes each, low
-byte first) instead of step 2, and `0x32` instead of `0x31` in step 5; the
+byte first) instead of step 2, and `0x33` instead of `0x30` in step 5; the
 16 values read back are IEEE-754 singles.
 
 **On the Tiny Tapeout demo board**, copy `test/gemm_protocol.py` and
@@ -93,6 +100,8 @@ byte first) instead of step 2, and `0x32` instead of `0x31` in step 5; the
 import tt_um_sahpar_gemm4x4 as g
 g.main()        # self-tests on silicon (ID, identity, random, accumulate, tiled 8x8)
 g.demo_8x8()    # prints an 8x8 int8 matmul computed on the 4x4 chip
+g.matmul([[1, 2], [3, 4]], [[5, 6], [7, 8]])     # your own int8 matrices, any size
+g.matmul([[0.5, -1.25]], [[2.0], [3.5]])         # real numbers (BF16 in, FP32 out)
 ```
 
 These scripts use the same protocol and tiling code as the cocotb simulation

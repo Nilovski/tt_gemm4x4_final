@@ -8,8 +8,8 @@ over an 8-bit byte-serial host protocol. The host tiles matrix products of any
 size onto the array, e.g. an 8x8 product as 4 output blocks x 2 K-blocks.
 
 - Top module: `tt_um_sahpar_gemm4x4`
-- Tiles: 4x2
-- Chip ID: `0xA4`
+- Tiles: 6x2
+- Chip ID: `0xA8`
 - Protocol, pinout and test procedure: [docs/info.md](docs/info.md)
 
 ## Features
@@ -22,6 +22,10 @@ size onto the array, e.g. an 8x8 product as 4 output blocks x 2 K-blocks.
   `CLEAR_GEMM` (0x21) starts a new one
 - `BUSY` (`uio[4]`) and sticky `DONE` (`uio[5]`) outputs; DONE can be used as
   an interrupt line
+- Real-number mode: BF16 operands (`0x12`/`0x13`) converted on-chip to int8
+  with a per-matrix power-of-two scale; results read back as FP32
+- `READ_C` (0x30) streams the whole result; STATUS reports busy, done,
+  A_loaded, B_loaded, result_valid and error
 - LOAD commands received while busy are consumed and discarded, so stored
   operands stay intact and the byte stream stays in sync
 

@@ -17,6 +17,8 @@ from gemm_protocol import (
     send_byte, wait_idle,
     OP_LOAD_A_REAL, OP_LOAD_B_REAL, gemm4_real, gemm4_real_ref,
     load_real_matrix, matmul_real, read_c_real, status_byte,
+    read_c_elements, read_c_real_elements, _host_uio,
+    OP_READ_C, ST_BUSY, ST_DONE, ST_A_LOADED, ST_B_LOADED, ST_RESULT_VALID, ST_ERROR,
 )
 
 
@@ -29,6 +31,7 @@ async def reset(dut):
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
+    _host_uio.clear()
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 2)
@@ -63,7 +66,7 @@ async def run_and_check(dut, a, b, label=""):
 # ---------------------------------------------------------------------------
 @cocotb.test()
 async def test_id(dut):
-    """ID replies 0xA4 and the static uio direction bits are right."""
+    """ID replies 0xA8 and the static uio direction bits are right."""
     await reset(dut)
     assert int(dut.uio_oe.value) == 0b0011_1010, f"uio_oe={int(dut.uio_oe.value):#010b}"
     assert int(dut.uio_out.value) & (1 << RX_READY), "RX_READY should be high"
@@ -190,7 +193,8 @@ async def test_done_flag(dut):
     await wait_idle(dut)
     assert int(dut.uio_out.value) & (1 << DONE), "DONE pin should be high after a run"
     await send_byte(dut, OP_STATUS)
-    assert await recv_byte(dut) == 0b10, "STATUS should be done=1, busy=0"
+    st = await recv_byte(dut)
+    assert st == ST_DONE | ST_A_LOADED | ST_B_LOADED | ST_RESULT_VALID, f"STATUS={st:#010b}"
     # still set after unrelated traffic (sticky)
     await send_byte(dut, OP_ID)
     await recv_byte(dut)
@@ -354,7 +358,7 @@ async def test_real_tiled(dut):
 
 @cocotb.test()
 async def test_scale_mismatch_flag(dut):
-    """GEMM (accumulate) with a different scale sets STATUS bit 2;
+    """GEMM (accumulate) with a different scale sets STATUS error (bit 5);
     CLEAR_GEMM clears it."""
     await reset(dut)
     ones = [1.0] * (N * K)
@@ -364,15 +368,15 @@ async def test_scale_mismatch_flag(dut):
     await wait_idle(dut)
     await send_byte(dut, OP_GEMM)                     # same scale: fine
     await wait_idle(dut)
-    assert not (await status_byte(dut)) & 4
+    assert not (await status_byte(dut)) & ST_ERROR
     assert await read_c_real(dut) == [8.0] * (N * N)
     await load_real_matrix(dut, OP_LOAD_A_REAL, [4.0] * (N * K))
     await send_byte(dut, OP_GEMM)                     # different scale
     await wait_idle(dut)
-    assert (await status_byte(dut)) & 4
+    assert (await status_byte(dut)) & ST_ERROR
     await send_byte(dut, OP_CLEAR_GEMM)
     await wait_idle(dut)
-    assert not (await status_byte(dut)) & 4
+    assert not (await status_byte(dut)) & ST_ERROR
     assert await read_c_real(dut) == [16.0] * (N * N)
 
 
@@ -395,3 +399,79 @@ async def test_real_zeros_and_tiny(dut):
     # just above it stays exact: 1.5 * 2^-126
     b = [1.5 * 2.0 ** -62 if i % 5 == 0 else 0.0 for i in range(K * N)]
     assert await gemm4_real(dut, a, b) == [1.5 * 2.0 ** -126 if i % 5 == 0 else 0.0 for i in range(N * N)]
+
+
+# ---------------------------------------------------------------------------
+# plan-aligned STATUS bits and READ_C streaming
+# ---------------------------------------------------------------------------
+@cocotb.test()
+async def test_status_bits(dut):
+    """A_loaded / B_loaded / result_valid / error follow the plan's STATUS map."""
+    await reset(dut)
+    assert await status_byte(dut) == 0, "STATUS must be 0 after reset"
+    await load_matrix(dut, OP_LOAD_A, [1] * 16)
+    assert await status_byte(dut) == ST_A_LOADED
+    await load_matrix(dut, OP_LOAD_B, [1] * 16)
+    assert await status_byte(dut) == ST_A_LOADED | ST_B_LOADED
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await send_byte(dut, OP_NOP)
+    st = await status_byte(dut)
+    assert st & ST_BUSY and not st & (ST_DONE | ST_RESULT_VALID), f"mid-run STATUS={st:#010b}"
+    await wait_idle(dut)
+    st = await status_byte(dut)
+    assert st == ST_DONE | ST_A_LOADED | ST_B_LOADED | ST_RESULT_VALID, f"STATUS={st:#010b}"
+    # a command while busy is ignored and flags error until the next CLEAR_GEMM
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await send_byte(dut, OP_GEMM)
+    await wait_idle(dut)
+    assert await status_byte(dut) & ST_ERROR, "GEMM while busy should set error"
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await wait_idle(dut)
+    assert not await status_byte(dut) & ST_ERROR, "CLEAR_GEMM should clear error"
+    assert await read_c(dut) == [4] * 16
+
+
+@cocotb.test()
+async def test_read_c_stream(dut):
+    """READ_C (0x30) and READ_C_REAL_ALL (0x33) stream the same values as the
+    per-byte READ_C_ELEMENT / READ_C_REAL reads, then the protocol continues."""
+    await reset(dut)
+    rng = random.Random(0x30)
+    a = [rng.randint(-128, 127) for _ in range(16)]
+    b = [rng.randint(-128, 127) for _ in range(16)]
+    await load_matrix(dut, OP_LOAD_A, a)
+    await load_matrix(dut, OP_LOAD_B, b)
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await wait_idle(dut)
+    streamed = await read_c(dut)
+    assert streamed == matmul(a, b)
+    assert streamed == await read_c_elements(dut)
+    await send_byte(dut, OP_ID)
+    assert await recv_byte(dut) == CHIP_ID
+
+    fa = [rng.uniform(-2, 2) for _ in range(16)]
+    fb = [rng.uniform(-2, 2) for _ in range(16)]
+    await load_real_matrix(dut, OP_LOAD_A_REAL, fa)
+    await load_real_matrix(dut, OP_LOAD_B_REAL, fb)
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await wait_idle(dut)
+    streamed = await read_c_real(dut)
+    assert streamed == gemm4_real_ref(fa, fb)
+    assert streamed == await read_c_real_elements(dut)
+
+
+@cocotb.test()
+async def test_read_c_slow_host(dut):
+    """READ_C waits for TX_READY on every byte (host back-pressure)."""
+    await reset(dut)
+    await load_matrix(dut, OP_LOAD_A, list(range(16)))
+    await load_matrix(dut, OP_LOAD_B, [1] * 16)
+    await send_byte(dut, OP_CLEAR_GEMM)
+    await wait_idle(dut)
+    await send_byte(dut, OP_READ_C)
+    raw = []
+    for _ in range(64):
+        await ClockCycles(dut.clk, 7)       # slow host
+        raw.append(await recv_byte(dut))
+    words = [raw[i] | raw[i + 1] << 8 | raw[i + 2] << 16 | raw[i + 3] << 24 for i in range(0, 64, 4)]
+    assert words == matmul(list(range(16)), [1] * 16)

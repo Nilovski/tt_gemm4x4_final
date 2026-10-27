@@ -35,11 +35,21 @@ OP_LOAD_A_REAL = 0x12  # BF16, 2 bytes per element, low byte first
 OP_LOAD_B_REAL = 0x13
 OP_GEMM = 0x20  # C += A x B
 OP_CLEAR_GEMM = 0x21  # C  = A x B
+OP_READ_C = 0x30  # streams all of C: 16 elements x 4 bytes, int32
 OP_READ_C_ELEMENT = 0x31
 OP_READ_C_REAL = 0x32  # C as FP32, 4 little-endian bytes per element
+OP_READ_C_REAL_ALL = 0x33  # streams all of C as FP32
 OP_STATUS = 0x40
 OP_ID = 0x41
-CHIP_ID = 0xA4
+CHIP_ID = 0xA8
+
+# STATUS bits
+ST_BUSY = 0x01
+ST_DONE = 0x02
+ST_A_LOADED = 0x04
+ST_B_LOADED = 0x08
+ST_RESULT_VALID = 0x10
+ST_ERROR = 0x20
 
 # 21-bit accumulators: at most 63 summed products, i.e. 15 runs of K=4
 MAX_RUNS_PER_READ = 15
@@ -52,9 +62,16 @@ class GemmTimeout(Exception):
 # ---------------------------------------------------------------------------
 # byte-level protocol
 # ---------------------------------------------------------------------------
+_host_uio = {}  # uio bits driven by the host, kept here rather than read back
+
+
 def _set_uio_bit(dut, bit, val):
-    cur = int(dut.uio_in.value)
-    dut.uio_in.value = (cur | (1 << bit)) if val else (cur & ~(1 << bit))
+    # Track the value locally: reading uio_in back can return a stale value
+    # when a previous write has not been applied yet (cocotb defers writes).
+    cur = _host_uio.get(id(dut), 0)
+    cur = (cur | (1 << bit)) if val else (cur & ~(1 << bit))
+    _host_uio[id(dut)] = cur
+    dut.uio_in.value = cur
 
 
 async def send_byte(dut, value):
@@ -97,7 +114,7 @@ async def status(dut):
 
 
 async def status_byte(dut):
-    """Raw STATUS: bit 0 busy, bit 1 done, bit 2 scale_mismatch."""
+    """Raw STATUS: busy, done, A_loaded, B_loaded, result_valid, error (bits 0-5)."""
     await send_byte(dut, OP_STATUS)
     return await recv_byte(dut)
 
@@ -110,8 +127,24 @@ async def wait_idle(dut, max_polls=40):
     raise GemmTimeout("GEMM never finished (busy stuck high)")
 
 
+def _words(raw):
+    return [raw[i] | raw[i + 1] << 8 | raw[i + 2] << 16 | raw[i + 3] << 24
+            for i in range(0, len(raw), 4)]
+
+
+def _signed32(w):
+    return w - (1 << 32) if w & (1 << 31) else w
+
+
 async def read_c(dut):
-    """Read the N*N result block (4 little-endian bytes each), signed 32-bit."""
+    """READ_C: the N*N result block as signed 32-bit values, one streamed command."""
+    await send_byte(dut, OP_READ_C)
+    raw = [await recv_byte(dut) for _ in range(4 * N * N)]
+    return [_signed32(w) for w in _words(raw)]
+
+
+async def read_c_elements(dut):
+    """Same as read_c, but byte by byte with READ_C_ELEMENT."""
     out = []
     for elem in range(N * N):
         value = 0
@@ -240,7 +273,14 @@ async def load_real_matrix(dut, opcode, values):
 
 
 async def read_c_real(dut):
-    """Read the N*N result block as floats (FP32 from READ_C_REAL)."""
+    """READ_C_REAL_ALL: the N*N result block as floats, one streamed command."""
+    await send_byte(dut, OP_READ_C_REAL_ALL)
+    raw = [await recv_byte(dut) for _ in range(4 * N * N)]
+    return [struct.unpack("<f", struct.pack("<I", w))[0] for w in _words(raw)]
+
+
+async def read_c_real_elements(dut):
+    """Same as read_c_real, but byte by byte with READ_C_REAL."""
     out = []
     for elem in range(N * N):
         word = 0
