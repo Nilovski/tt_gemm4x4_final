@@ -1,0 +1,84 @@
+name: gds
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  gds:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build GDS
+        id: build
+        timeout-minutes: 320
+        uses: TinyTapeout/tt-gds-action@ttsky26d
+        with:
+          pdk: sky130A
+
+      - name: Report GDS failure
+        if: always() && steps.build.outcome != 'success'
+        shell: bash
+        run: |
+          set +e +o pipefail
+          shopt -s globstar nullglob
+          logs=(runs/**/*.log)
+          if [ ${#logs[@]} -eq 0 ]; then
+            mapfile -t logs < <(find . -name '*.log' -not -path '*/node_modules/*' 2>/dev/null | head -n 300)
+          fi
+          echo "found ${#logs[@]} log files"
+          {
+            echo "== last flow steps"
+            ls -1 runs/wokwi 2>/dev/null | tail -n 4
+            echo "== routing progress"
+            grep -hE "Completing|violations|DRT-0199|DRT-0195|GRT-0096" "${logs[@]}" 2>/dev/null | tail -n 12
+            echo "== utilization"
+            grep -hiE "utilization|design area" "${logs[@]}" 2>/dev/null | tail -n 8
+            echo "== error lines"
+            grep -HnE "\[ERROR|ERROR|Error:|error:|FATAL|Traceback" "${logs[@]}" 2>/dev/null | tail -n 40
+            last=$(ls -t "${logs[@]}" 2>/dev/null | head -n 1)
+            echo "== tail of $last"
+            [ -n "$last" ] && tail -n 40 "$last"
+            echo "== files"
+            ls -1 runs/wokwi 2>/dev/null | head -n 60
+            ls -la 2>/dev/null | head -n 30
+          } > gds_failure.txt
+          cat gds_failure.txt
+          msg=$(cut -c1-300 gds_failure.txt | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+          echo "::error title=GDS failure details::${msg}"
+
+  precheck:
+    needs: gds
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Run Tiny Tapeout Precheck
+        uses: TinyTapeout/tt-gds-action/precheck@ttsky26d
+
+  gl_test:
+    needs: gds
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: GL test
+        uses: TinyTapeout/tt-gds-action/gl_test@ttsky26d
+
+  viewer:
+    needs: gds
+    # GitHub Pages only accepts deployments from the default branch
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write      # to deploy to Pages
+      id-token: write   # to verify the deployment originates from an appropriate source
+    environment:
+      name: github-pages
+    steps:
+      - uses: TinyTapeout/tt-gds-action/viewer@ttsky26d
