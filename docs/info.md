@@ -7,7 +7,7 @@ delayed by *i* and *j* cycles, so each processing element PE(i,j) receives
 A[i][k] and B[k][j] on the same cycle and accumulates C[i][j] in place. A run
 takes K + 2(N-1) = 10 clock cycles.
 
-A **data preparation unit** sits in front of the array. It holds A and B in
+A data preparation unit sits in front of the array. It holds A and B in
 4 + 4 lane buffers (one per array row and column, 4 values deep) and, on the
 run's start signal, feeds them to the array edges with the skew above. The
 lanes rotate back to their original order after each run, so the same
